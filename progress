@@ -1,0 +1,223 @@
+#! /usr/bin/perl
+
+use strict;
+use warnings;
+use Data::Dumper;
+use Text::CSV;
+
+my $file = shift;
+
+my $fh;
+if( $file ){
+	open($fh, '<', $file) or die("Error opening '$file': $!");
+}else{
+	$fh = *STDIN;
+}
+
+my $csv = Text::CSV->new ( { binary => 1 } )  # should set binary attribute.
+                or die "Cannot use CSV: ".Text::CSV->error_diag ();
+
+my $checkpoint_times;
+my $entrants;
+my $teams;
+my %field_length = (
+	name => 10,
+	team_name => 10,
+	route => 15,
+);
+while (my $line = readline($fh)){
+
+	chomp($line);
+	$line =~ s/",(\d)/","$1/;
+	$csv->parse($line);
+	my @row = $csv->fields();
+
+	#$line=~s/^"//;
+	#$line=~s/"$//;
+	#my @row = split(m/"?,"?/, $line);
+
+	my $entrant;
+
+
+	# The CSV is broken (quote marks in fields are not escaped) but this only 
+	# affects two teams, who we'll ignore for now. 
+	# This manifests in Text::CSV returning a load of empty fields, so skip
+	# lines with an empty first field, and the header.
+	next unless my $number = shift(@row);
+	next if $number eq '';
+	next if $number eq 'Number';
+
+	$entrant->{number}    = $number;
+	$entrant->{name}      = shift(@row);
+	$entrant->{team_name} = shift(@row);
+	$entrant->{route}     = shift(@row);
+	$field_length{name} = length($entrant->{name}) if length($entrant->{name}) > $field_length{name};
+	$field_length{team_name} = length($entrant->{team_name}) if length($entrant->{team_name}) > $field_length{team_name};
+	$field_length{route} = length($entrant->{route}) if length($entrant->{route}) > $field_length{route};
+
+	# I'm not sure what the last three fields are so lets strip them
+	pop(@row);
+	pop(@row);
+	pop(@row);
+
+	$entrant->{total_time} = pop(@row);
+	$entrant->{complete} = pop(@row);
+	$entrant->{waiting_time} = pop(@row);
+
+	my @visited_checkpoints;
+
+	my $last_checkpoint = undef;
+	my $last_checkpoint_time = undef;
+	my @checkpoints = @row;
+
+	for (my $i = 0; $i<=@checkpoints; $i++){
+		
+		my $time = $checkpoints[$i];
+		next unless $time;
+		$last_checkpoint_time = $time if $time =~ m/.+/;
+		$last_checkpoint = $i if $time =~ m/.+/;
+
+		# We're going to figure out some averages for the time taken to
+		# move between checkpoints, so here we figure out this particular
+		# person's time-taken between this checkpoint and the next.
+		#
+		# (this and next, rather than prev and this, because what we will
+		# go on to be interested in is when we can expect an entrant to 
+		# arrive at the next checkpoint).
+		#
+		# This is crude in a relatively bad way - it can only deal with
+		# people going between consecutive points, but *everyone* appears
+		# to skip at least one point since no route involves all the 
+		# checkpoints.
+		# For now, then, for people on a route that skip from checkpoint 15
+		# to 20 or something we have no idea how long that step normally
+		# takes
+		next unless $checkpoints[$i+1] and $checkpoints[$i+1] =~ m/:/;
+		my $this_checkpoint = $checkpoints[$i];
+		my $next_checkpoint = $checkpoints[$i + 1];
+		next unless $next_checkpoint and $this_checkpoint;
+		$this_checkpoint =~ s/\s+R$//;
+		$next_checkpoint =~ s/\s+R$//;
+		my $begin = time_to_mins($this_checkpoint);
+		my $end = time_to_mins($next_checkpoint);
+		next unless $begin and $end and $begin > 0 and $end > 0;
+		my $gap = $end - $begin;
+		push(@{$checkpoint_times->{$i}}, $gap);
+
+	}
+
+	# Retirees have an 'R' on the end of the time at the checkpoint they 
+	# retired at (which is their last checkpoint).
+	if($last_checkpoint_time =~ s/\s+R$//){
+		$entrant->{retired} = $last_checkpoint;
+	}
+
+	$entrant->{last_checkpoint_time} = $last_checkpoint_time;
+	$entrant->{last_checkpoint_mins} = time_to_mins($last_checkpoint_time);
+	$entrant->{last_checkpoint} = $last_checkpoint;
+
+	$entrants->{ $entrant->{number} } = $entrant;
+
+	$number =~ m/(\d+)(\w)/;
+	my ($team_number,$entrant_letter) = ($1,$2);
+	if( !$entrant->{retired} and !$entrant->{complete}){
+		$teams->{$team_number}->{$entrant_letter} = $entrant;
+	}
+
+
+}
+close $fh;
+
+my @checkpoint_averages;
+foreach my $checkpoint (sort(keys(%{$checkpoint_times}))){
+	my @times = @{$checkpoint_times->{$checkpoint}};
+
+	my $total_time;
+	foreach my $time (@times){
+		$total_time += $time;
+	}
+	my $average = $total_time / @times;
+
+	$checkpoint_averages[$checkpoint] = int($average);
+}
+
+
+# # #
+# #
+#
+
+my @frontmost_team = (undef, 0);
+my @rearmost_team = (undef, 100);
+my @latest_team = (undef, 0);
+my @earliest_team = (undef, 10000);
+printf("      %-$field_length{team_name}s %-$field_length{route}s %7s %10s %10s\n", "Team", "Route", "Last CP", "Last Time", "Expected Time");
+my $format = "%-5s %-$field_length{team_name}s %-$field_length{route}s %7d %10s %10s\n";
+foreach my $team_number (sort {$a <=> $b} keys(%{$teams})){
+	my $entrant_letter = (keys(%{$teams->{$team_number}}))[0];
+	my $e = $teams->{$team_number}->{$entrant_letter};
+	my $expected = time_to_next_checkpoint($e);
+	
+	@rearmost_team  = ($e->{team_name}, $e->{last_checkpoint}) if $e->{last_checkpoint} < $rearmost_team[1];
+	@frontmost_team = ($e->{team_name}, $e->{last_checkpoint}) if $e->{last_checkpoint} > $frontmost_team[1];
+
+	@earliest_team = ($e->{team_name}, $e->{last_checkpoint_mins}, $e->{last_checkpoint}) if $e->{last_checkpoint_mins} < $earliest_team[1];	
+	@latest_team = ($e->{team_name}, $e->{last_checkpoint_mins}, $e->{last_checkpoint}) if $e->{last_checkpoint_mins} > $latest_team[1];	
+
+	printf ($format, $team_number,$e->{team_name},$e->{route},$e->{last_checkpoint},$e->{last_checkpoint_time}, $expected);
+
+
+}
+print "\n\n";
+print "Rearmost team:  CP".$rearmost_team[1]." ".$rearmost_team[0]."\n";
+print "Frontmost team: CP".$frontmost_team[1]." ".$frontmost_team[0]."\n";
+print "\n";
+print "Last-heard-from team:     CP".$latest_team[2]." @ ".mins_to_time($latest_team[1])." ".$latest_team[0]."\n";
+print "Earliest-heard-from team: CP".$earliest_team[2]." @ ".mins_to_time($earliest_team[1])." ".$earliest_team[0]."\n";
+
+print "\nAverage time between CPs:\n";
+for (my $i = 0; $i<=@checkpoint_averages; $i++){
+	next unless $checkpoint_averages[$i];
+	printf ("%2d -> %2d %s\n", $i, $i+1, mins_to_time($checkpoint_averages[$i]));
+
+}
+#
+# #
+# # #
+sub time_to_next_checkpoint{
+	my $e = shift;
+	my $checkpoint_number = $e->{last_checkpoint};
+	my $checkpoint_time = $e->{last_checkpoint_time};
+
+	my $expected_gap = $checkpoint_averages[$checkpoint_number];
+	return "" unless $expected_gap;
+	my $checkpoint_mins = time_to_mins($checkpoint_time);
+
+	my $expected_time = mins_to_time($checkpoint_mins + $expected_gap);
+	return $expected_time;
+
+#y $checkpoint_mins =  time_to_mins($checkpoint_time);
+#my $expected_time = $checkpoint_mins + $expected_gap;
+#return mins_to_time($checkpoint_time) || " ";
+}
+
+
+
+
+sub time_to_mins{
+	my $time = shift;
+	if($time =~ m/(\d+):(\d+)/){
+		my ($hr,$min) = ($1,$2);
+		$min = ($hr * 60) + $min;
+		return $min;
+	}
+	return undef;
+}
+
+sub mins_to_time{
+	my $in = shift;
+	my $hours = int($in/60);
+	$hours = $hours - 24 if $hours >= 24;
+	my $mins = $in % 60;
+	return sprintf("%02d:%02d", $hours, $mins);
+} 
+
